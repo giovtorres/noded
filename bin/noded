@@ -1,0 +1,329 @@
+#!/usr/bin/env python
+
+# This file is a part of Noded.
+#
+# Noded is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# Noded is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+from __future__ import print_function, division#, unicode_literals
+
+import json
+import os
+import sys
+import time
+from collections import defaultdict, deque
+from glob import glob
+from pwd import getpwuid
+from socket import gethostname
+
+try:
+    from ConfigParser import ConfigParser
+except ImportError:
+    from configparser import ConfigParser
+
+try:
+    import redis
+except ImportError:
+    print("You must install python-redis.")
+    sys.exit(1)
+
+# Location of noded.conf. (Default: /etc/noded)
+CONFIG = "/etc/noded/noded.conf"
+
+def parse_config():
+    """Parse noded.conf and return a ConfigParser object."""
+    if os.path.isfile(CONFIG):
+        noded_config = ConfigParser()
+        noded_config.read(CONFIG)
+        return noded_config
+    else:
+        print("You need to install /etc/noded/noded.conf")
+        sys.exit(1)
+
+
+def expand_cpuset(cpusetcpus):
+    """Return a list of CPUs, translated from a cgroup cpuset.
+
+    For example, with a cpuset of "0-3", this function should return
+    [0, 1, 2, 3].
+
+    Args:
+        cpusetcpus (str): A cpuset string from cpuset.cpus cgroup file
+    Return:
+        list: List of CPUs included in a provided cpuset
+    """
+    cpulist = []
+    for cpus in cpusetcpus.split(","):
+        if "-" in cpus:
+            cpusplit = cpus.split("-")
+            for cpu in range(int(cpusplit[0]), int(cpusplit[1]) + 1):
+                cpulist.append(cpu)
+        else:
+            cpulist.append(int(cpus))
+    return cpulist
+
+
+def get_sys_info():
+    """Return dictionary of system information"""
+    return {"nodename": gethostname(),
+            "total_logical_cpus": os.sysconf("SC_NPROCESSORS_ONLN")}
+
+
+def find(name, path):
+    result = []
+    for root, dirs, files in os.walk(path):
+        if name in files:
+            result.append(os.path.join(root, name))
+    return result
+
+
+def get_running_threads(pid, procpath="/proc"):
+    """Return a dict of running thread ids for a given process id."""
+
+    # Search the pids task directory for a list of thread ids
+    try:
+        thread_ids = os.listdir(os.path.join(procpath, "%s/task") % pid)
+    except OSError:
+        # Short-lived thread disappeared on us; skip for now and try again
+        # in the next round
+        return
+
+    # Sort the list
+    thread_ids.sort()
+
+    # Initialize running_threads with empty lists for each allocated cpu
+    running_threads = defaultdict(list)
+
+    # For each thread id in the list of all thread ids, append the thread id
+    # to the 'list_of_threads' dictionary only if the thread is in the RUNNING
+    # state
+    for thread_id in thread_ids:
+        pidstat = os.path.join(procpath, "%s/task/%s/stat") % (pid, thread_id)
+        try:
+            with open(pidstat, 'r') as fname:
+                stat = fname.read().strip()
+        except IOError:
+            # An exception here means the thread disappeared on us;
+            # just continue on with the next thread in this for loop
+            continue
+        else:
+            # If threads didn't die on us, get some info for each thread
+            if stat:
+                values = stat.split()
+                name = values[1].translate(None, "()")
+                state = values[2]
+                processor = values[38]
+
+            # Only append thread to the list_of_threads if thread is in RUNNING
+            # state
+            if state == 'R' or state == 'D':
+                running_threads[processor].append([name, state, thread_id])
+
+    # Return dict of running threads
+    return running_threads
+
+
+def lineup_children(cpu_affinity, children_pids, procpath="/proc"):
+    """Return the number of running threads and a cpu mapping for its processes."""
+
+    num_running_children = 0
+
+    # Create a dictionary of empty lists with keys corresponding to the
+    # cpu_affinity
+    cpu_and_procs = dict((cpu, []) for cpu in cpu_affinity)
+
+    # For each child pid of a slurmstepd process, get all threads and
+    # append them as a dictionary to a new list
+    cpu_and_procs_list = []
+
+    for child in children_pids:
+        run_threads = get_running_threads(child, procpath)
+        if run_threads:
+            cpu_and_procs_list.append(run_threads)
+
+    # For each thread in the above list, populate the precreated
+    # cpu_and_procs dictionary
+    for cpu_ddict in cpu_and_procs_list:
+        try:
+            for cpu, threads in cpu_ddict.iteritems():
+                for threadinfo in threads:
+                    cpu_and_procs[int(cpu)].append([threadinfo[0], threadinfo[1]])
+        except AttributeError:
+            continue
+
+    num_running_children = sum(len(thread)
+                               for thread in cpu_and_procs.itervalues())
+
+    if num_running_children > len(cpu_affinity):
+        job_overloaded = bool(1)
+    else:
+        job_overloaded = bool(0)
+
+    return (num_running_children, cpu_and_procs, job_overloaded)
+
+
+if __name__ == "__main__":
+    # Load up the system info once at runtime
+    SYSINFO = get_sys_info()
+
+    # Redis constants
+    REDISHOST = '192.168.1.2'
+    REDISPORT = 6379
+    REDISDB = 0
+    REDISAUTH = "secret"
+    REDISTIMEOUT = 1
+
+    # Initialize connection to Redis
+    REDISCONN = redis.StrictRedis(host=REDISHOST,
+                                  port=REDISPORT,
+                                  db=REDISDB,
+                                  password=REDISAUTH,
+                                  socket_timeout=REDISTIMEOUT)
+
+    # Set the sleep time (in seconds) between collecting metrics
+    SLEEP = 30
+
+    # Set the expire time (in seconds) for Redis keys, in seconds
+    EXPIRE = 300
+
+    # Get hostname
+    HOSTNAME = gethostname()
+
+    # Ring Buffer max length
+    RB_MAXLEN = 4
+
+    # Initialize ring buffer for determining overloaded node
+    overloadq = deque([0, 0, 0, 0], RB_MAXLEN)
+
+    # Main loop
+    while 1:
+        # Start by copying the SYSINFO dictionary above...
+        fullinfo = SYSINFO.copy()
+
+        meminfo = dict((m.split()[0].rstrip(':'), int(m.split()[1]))
+                       for m in open('/proc/meminfo').readlines())
+
+        memfree = meminfo["MemFree"]
+        membuffers = meminfo["Buffers"]
+        memcached = meminfo["Cached"]
+        memtotal = meminfo["MemTotal"]
+        memused = memtotal - (memfree + membuffers + memcached)
+        swapfree = meminfo["SwapFree"]
+        swaptotal = meminfo["SwapTotal"]
+        swapused = swaptotal - swapfree
+
+        # ... then append various metrics
+        fullinfo.update({"load": os.getloadavg()[0]})
+        fullinfo.update({"last_updated": time.time()})
+        fullinfo.update({"total_memory": memtotal * 1024})
+        fullinfo.update({"total_swap": swaptotal * 1024})
+        fullinfo.update({"total_memory_used_percent": memused * 100 // memtotal})
+        fullinfo.update({"total_swap_used_percent": swapused * 100 // swaptotal})
+
+        # Initialize default
+        jobs = defaultdict(list)
+        node_overloaded = bool(0)
+
+        # Get all jobids from the cgroup filesystem
+        alljobs = [int(job.split("job_")[1])
+                   for job in glob("/cgroup/cpuset/slurm/uid_*/job_*")]
+
+        # If there any jobs, run it through the mill
+        if alljobs:
+            for jobid in alljobs:
+                memlimitpath = glob("/cgroup/memory/slurm/uid_*/job_" +
+                                         str(jobid) + "/memory.limit_in_bytes")
+
+                memusagepath = glob("/cgroup/memory/slurm/uid_*/job_" +
+                                         str(jobid) + "/memory.stat")
+
+                cpusetcpuspath = glob("/cgroup/cpuset/slurm/uid_*/job_" +
+                                           str(jobid) + "/cpuset.cpus")
+
+                cpusetpath = glob("/cgroup/cpuset/slurm/uid_*/job_" +
+                                       str(jobid))
+
+                uidpath = glob("/cgroup/memory/slurm/uid_*/job_" +
+                                    str(jobid))
+
+                if uidpath:
+                    uid = os.path.split(uidpath[0])[0].split("uid_")[1]
+                    user = getpwuid(int(uid))[0]
+
+                if memlimitpath:
+                    with open(memlimitpath[0], "r") as fname:
+                        memlimit = fname.read().strip()
+                else:
+                    memlimit = 0
+
+                memusage = 0
+                if memusagepath:
+                    with open(memusagepath[0], "r") as fname:
+                        for line in fname.readlines():
+                            if line.startswith("total_rss"):
+                                memusage += int(line.strip().split()[1])
+                            if line.startswith("total_mapped_file"):
+                                memusage += int(line.strip().split()[1])
+
+                if cpusetcpuspath:
+                    with open(cpusetcpuspath[0], "r") as fname:
+                        cpusetcpus = expand_cpuset(fname.read().strip())
+                else:
+                    cpusetcpus = []
+
+                proclist = set()
+
+                if cpusetpath:
+                    for path in find("cgroup.procs", cpusetpath[0]):
+                        with open(path, "r") as fname:
+                            for proc in fname.readlines():
+                                proclist.add(proc.strip())
+
+                num_running_children, cpu_and_procs, job_overloaded = lineup_children(cpusetcpus, proclist)
+
+
+                if job_overloaded:
+                    node_overloaded = bool(1)
+
+                jobs[jobid] = {"mem_alloc": memlimit,
+                               "mem_usage": memusage,
+                               "active_threads": num_running_children,
+                               "cpu_and_procs": cpu_and_procs,
+                               "overloaded": job_overloaded,
+                               "user": user}
+
+            fullinfo.update({"jobs": jobs})
+
+        if node_overloaded:
+            overloadq.append(1)
+        else:
+            overloadq.append(0)
+
+        # If overloaded queue (overloadq) is full, node has an overloaded for
+        # RB_MAXLEN * SLEEP seconds
+        if sum(overloadq) == RB_MAXLEN:
+            fullinfo.update({"overloaded": bool(1)})
+        else:
+            fullinfo.update({"overloaded": bool(0)})
+
+        try:
+            # Push fullinfo dictionary as JSON to Redis DB;
+            # Then, sleep for 30 seconds
+            REDISCONN.set(HOSTNAME, json.dumps(fullinfo), ex=EXPIRE)
+            time.sleep(SLEEP)
+        except (redis.exceptions.ConnectionError,
+                redis.exceptions.ResponseError,
+                redis.exceptions.TimeoutError):
+            # If Redis DB is down, sleep for 30 seconds and try again
+            time.sleep(SLEEP)
+            continue
