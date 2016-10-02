@@ -122,4 +122,4 @@ noded: started
 ## License
 
 This project is in the worldwide public domain.  See
-[LICENSE](LICENSE.MD) and [CONTRIBUTING](CONTRIBUTING.md) for more information.
+[LICENSE](LICENSE.md) and [CONTRIBUTING](CONTRIBUTING.md) for more information.
