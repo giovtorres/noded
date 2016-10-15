@@ -1,22 +1,8 @@
 #!/usr/bin/env python
 
-# This file is a part of Noded.
-#
-# Noded is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# Noded is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with this program.  If not, see <http://www.gnu.org/licenses/>.
-#
-from __future__ import print_function, division#, unicode_literals
+from __future__ import print_function, division, unicode_literals
 
+import argparse
 import json
 import os
 import sys
@@ -37,17 +23,15 @@ except ImportError:
     print("You must install python-redis.")
     sys.exit(1)
 
-# Location of noded.conf. (Default: /etc/noded)
-CONFIG = "/etc/noded/noded.conf"
 
-def parse_config():
+def parse_config(config):
     """Parse noded.conf and return a ConfigParser object."""
-    if os.path.isfile(CONFIG):
-        noded_config = ConfigParser()
-        noded_config.read(CONFIG)
+    if os.path.isfile(config):
+        noded_config = ConfigParser({"redis_auth": None})
+        noded_config.read(config)
         return noded_config
     else:
-        print("You need to install /etc/noded/noded.conf")
+        print("You need to specify path to noded.conf")
         sys.exit(1)
 
 
@@ -74,9 +58,17 @@ def expand_cpuset(cpusetcpus):
 
 
 def get_sys_info():
-    """Return dictionary of system information"""
-    return {"nodename": gethostname(),
-            "total_logical_cpus": os.sysconf("SC_NPROCESSORS_ONLN")}
+    """
+    Return dictionary of system information
+
+    SC_NPROCESSORS_ONLN returns the number of processors which are currently
+    online (i.e. available).  See os.sysconf_names for dictionary values.
+
+    """
+    return {
+        "nodename": gethostname(),
+        "total_logical_cpus": os.sysconf(84)
+    }
 
 
 def find(name, path):
@@ -173,42 +165,51 @@ def lineup_children(cpu_affinity, children_pids, procpath="/proc"):
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-c", help="configuration file",
+                        dest="config", default="conf/noded.conf")
+    args = parser.parse_args()
+
+    noded_config = parse_config(args.config)
+
     # Load up the system info once at runtime
-    SYSINFO = get_sys_info()
+    sysinfo = get_sys_info()
 
     # Redis constants
-    REDISHOST = '192.168.1.2'
-    REDISPORT = 6379
-    REDISDB = 0
-    REDISAUTH = "secret"
-    REDISTIMEOUT = 1
+    redis_db = int(noded_config.get("defaults", "redis_db"))
+    redis_port = int(noded_config.get("defaults", "redis_port"))
+    redis_host = noded_config.get("defaults", "redis_host")
+    redis_timeout = int(noded_config.get("defaults", "redis_timeout"))
+    redis_auth = noded_config.get("defaults", "redis_auth")
 
     # Initialize connection to Redis
-    REDISCONN = redis.StrictRedis(host=REDISHOST,
-                                  port=REDISPORT,
-                                  db=REDISDB,
-                                  password=REDISAUTH,
-                                  socket_timeout=REDISTIMEOUT)
+    redisconn = redis.StrictRedis(
+        host=redis_host,
+        port=redis_port,
+        db=redis_db,
+        password=redis_auth,
+        socket_timeout=redis_timeout
+    )
 
     # Set the sleep time (in seconds) between collecting metrics
-    SLEEP = 30
+    sleep_time = int(noded_config.get("defaults", "sleep_time"))
 
     # Set the expire time (in seconds) for Redis keys, in seconds
-    EXPIRE = 300
-
-    # Get hostname
-    HOSTNAME = gethostname()
+    expire_time = int(noded_config.get("defaults", "expire_time"))
 
     # Ring Buffer max length
-    RB_MAXLEN = 4
+    rb_maxlen = int(noded_config.get("defaults", "rb_maxlen"))
+
+    # Get hostname
+    host_name = gethostname()
 
     # Initialize ring buffer for determining overloaded node
-    overloadq = deque([0, 0, 0, 0], RB_MAXLEN)
+    overloadq = deque([0, 0, 0, 0], rb_maxlen)
 
     # Main loop
     while 1:
-        # Start by copying the SYSINFO dictionary above...
-        fullinfo = SYSINFO.copy()
+        # Start by copying the sysinfo dictionary above...
+        fullinfo = sysinfo.copy()
 
         meminfo = dict((m.split()[0].rstrip(':'), int(m.split()[1]))
                        for m in open('/proc/meminfo').readlines())
@@ -256,15 +257,15 @@ if __name__ == "__main__":
                 uidpath = glob("/cgroup/memory/slurm/uid_*/job_" +
                                     str(jobid))
 
+                user = None
                 if uidpath:
                     uid = os.path.split(uidpath[0])[0].split("uid_")[1]
                     user = getpwuid(int(uid))[0]
 
+                memlimit = 0
                 if memlimitpath:
                     with open(memlimitpath[0], "r") as fname:
                         memlimit = fname.read().strip()
-                else:
-                    memlimit = 0
 
                 memusage = 0
                 if memusagepath:
@@ -285,9 +286,12 @@ if __name__ == "__main__":
 
                 if cpusetpath:
                     for path in find("cgroup.procs", cpusetpath[0]):
-                        with open(path, "r") as fname:
-                            for proc in fname.readlines():
-                                proclist.add(proc.strip())
+                        try:
+                            with open(path, "r") as fname:
+                                for proc in fname.readlines():
+                                    proclist.add(proc.strip())
+                        except IOError:
+                            continue
 
                 num_running_children, cpu_and_procs, job_overloaded = lineup_children(cpusetcpus, proclist)
 
@@ -310,8 +314,8 @@ if __name__ == "__main__":
             overloadq.append(0)
 
         # If overloaded queue (overloadq) is full, node has an overloaded for
-        # RB_MAXLEN * SLEEP seconds
-        if sum(overloadq) == RB_MAXLEN:
+        # rb_maxlen * sleep seconds
+        if sum(overloadq) == rb_maxlen:
             fullinfo.update({"overloaded": bool(1)})
         else:
             fullinfo.update({"overloaded": bool(0)})
@@ -319,11 +323,11 @@ if __name__ == "__main__":
         try:
             # Push fullinfo dictionary as JSON to Redis DB;
             # Then, sleep for 30 seconds
-            REDISCONN.set(HOSTNAME, json.dumps(fullinfo), ex=EXPIRE)
-            time.sleep(SLEEP)
+            redisconn.set(host_name, json.dumps(fullinfo), ex=expire_time)
+            time.sleep(sleep_time)
         except (redis.exceptions.ConnectionError,
                 redis.exceptions.ResponseError,
                 redis.exceptions.TimeoutError):
-            # If Redis DB is down, sleep for 30 seconds and try again
-            time.sleep(SLEEP)
+            # If Redis DB is down, sleep for sleep_time seconds and try again
+            time.sleep(sleep_time)
             continue
