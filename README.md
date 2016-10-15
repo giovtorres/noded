@@ -26,21 +26,10 @@ the thresholds configured in the supervisord configuration, for example no more
 than 3 times in 60 seconds.
 
 
-### Depends on Slurm configured with cgroups for CPU and or Memory:
+### Depends on Slurm configured with cgroups for CPU and Memory:
 
-* CR_CPU
 * CR_CPU_Memory
-* CR_Core
 * CR_Core_Memory 
-
-
-### Python 2.6
-(need to test Python 2.7 and 3.3+)
-
-Works on Linux only (depends on /proc)
-
-Noded will only report jobs in the RUNNING state.  If a job is PENDING, it has
-not be allocated resources on a node and Noded has no way of knowing about it.
 
 
 ## How does it work?
@@ -64,24 +53,25 @@ the default 30 seconds.
 
 Noded is single threaded.
 
+Noded will only report jobs in the RUNNING state.  If a job is PENDING, it has
+not be allocated resources on a node and Noded will not know about it.
+
 ## Installation
 
-Requires python-redis and hi-redis for performance
-Requires supervisord
-Requires nose for testing
+* Requires python-redis and hi-redis for performance
+* Requires supervisord
+* Requires nose for testing
+* Requires a Redis server (>=2.8)
 
-Requires a Redis server (>=2.8)
+Works on Linux only (depends on /proc).  Works with Python 2.6, 2.7 and 3.3+.
 
 
 ## Configuration
 
-* nodename prefix length
 * Redis credentials
 * sleep timer
 * redis key expiration
 * overloaded noded ring buffer length
-* load on by default
-* enable memory, swap, network
 
 
 ## Starting/Stopping Noded
