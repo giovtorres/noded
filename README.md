@@ -1,6 +1,6 @@
 # Noded - A Slurm Node Monitoring Daemon
 
-![Project Status](https://img.shields.io/badge/status-development-orange.svg)
+[![Build Status](https://travis-ci.org/giovtorres/noded.svg?branch=master)](https://travis-ci.org/giovtorres/noded)
 
 ## What is Noded?
 
